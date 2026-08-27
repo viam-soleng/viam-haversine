@@ -1,5 +1,0 @@
-
-viam-sdk==0.51.0
-
-typing-extensions
-haversine==2.9.0

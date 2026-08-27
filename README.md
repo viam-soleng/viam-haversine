@@ -1,10 +1,10 @@
 # Viam Haversine Component
 
-A Viam component that calculates the distance between two geographical points using the haversine formula. 
+A Viam sensor component that calculates the distance between two geographical points using the haversine formula.
 
 This component can either:
-1. Calculate distances between data from two configured sensors (via get_readings)
-2. Calculate distances between two manually provided coordinates (via do_command)
+1. Calculate distances between data from two configured sensors (via `GetReadings`)
+2. Calculate distances between two manually provided coordinates (via `DoCommand`)
 
 The distances are provided in three units:
 - Kilometers
@@ -17,7 +17,7 @@ This model implements a sensor component that calculates the great-circle distan
 
 ### Supported Sensor Types
 
-This component supports both **Sensor** and **MovementSensor** components as data sources. The component will automatically detect the type of each configured sensor and cast it appropriately. Both sensor types provide a `get_readings()` method that returns the same data format, so they work seamlessly with this component.
+This component supports both **Sensor** and **MovementSensor** components as data sources. It resolves each configured sensor by name under either API, and reads it through the readings API both types share.
 
 ### Configuration
 
@@ -51,18 +51,20 @@ The following attributes are optional for this model:
 | `sensor_1` | object | Optional | Configuration for the first location sensor (Sensor or MovementSensor) |
 | `sensor_2` | object | Optional | Configuration for the second location sensor (Sensor or MovementSensor) |
 
-If you don't configure both sensors, only the `do_command()` method will be fully functional. `get_readings()` will return an empty object if both sensors are not configured.
+If you don't configure both sensors, only `DoCommand` will be fully functional. `GetReadings` returns an empty object if both sensors are not configured.
 
 Each sensor configuration requires:
 - `name`: The name of the sensor component (can be either Sensor or MovementSensor)
-- `latitude`: JSON path to the latitude value in the sensor's readings
-- `longitude`: JSON path to the longitude value in the sensor's readings
+- `latitude`: Dot-separated path to the latitude value in the sensor's readings
+- `longitude`: Dot-separated path to the longitude value in the sensor's readings
 
 Each sensor configuration optionally supports:
-- `updated`: JSON path to an ISO8601 timestamp field (e.g., "2023-12-01T10:30:00Z")
+- `updated`: Path to an ISO 8601 timestamp field (e.g., "2023-12-01T10:30:00Z")
 - `expire`: Duration string after which the reading is considered stale (e.g., "1d", "12h", "10m", "30s", "100ms")
 
-If both `updated` and `expire` are specified for a sensor, the reading will be considered invalid and no distance will be calculated if the timestamp is older than the expire duration.
+If both `updated` and `expire` are specified for a sensor, the reading is considered invalid and no distance is calculated when the timestamp is older than the expire duration.
+
+A path step indexes a map key, or reads a field off a structured reading. A movement sensor reports its position as a geo point, so `position.lat` and `position.lng` both work, as do the aliases `position.latitude` and `position.longitude`.
 
 #### Example Configuration
 
@@ -85,23 +87,18 @@ If both `updated` and `expire` are specified for a sensor, the reading will be c
 }
 ```
 
-In this example:
-- `gps1` could be a MovementSensor (like a GPS module)
-- `phone_data` could be a regular Sensor (like a data source from a phone app)
-
-The component will automatically detect and handle both types correctly.
+In this example `gps1` is a MovementSensor (a GPS module) and `phone_data` is a regular Sensor (a data source from a phone app).
 
 ### Methods
 
-#### get_readings()
+#### GetReadings
 
 Returns the distance between the two configured sensors. The method will:
-1. Return an empty object ({}) if both sensors are not configured
-2. Check if sensor readings are still valid (if updated/expire fields are configured)
-3. Return an empty object ({}) if any sensor reading has expired
-4. Get readings from both configured sensors (works with both Sensor and MovementSensor)
-5. Extract latitude and longitude using the configured paths
-6. Calculate distances in multiple units
+1. Return an empty object (`{}`) if both sensors are not configured
+2. Read both configured sensors
+3. Return an empty object (`{}`) if either reading has expired, when `updated` and `expire` are configured
+4. Extract latitude and longitude using the configured paths
+5. Calculate distances in multiple units
 
 Example response when sensors are configured and readings are valid:
 ```json
@@ -120,7 +117,7 @@ Example response when sensors are configured and readings are valid:
 }
 ```
 
-#### do_command()
+#### DoCommand
 
 Calculates the distance between two manually provided coordinates. This method works regardless of sensor configuration, making it useful for one-off distance calculations or when you don't have physical sensors.
 
@@ -138,27 +135,33 @@ Example command:
 }
 ```
 
-The response format is identical to get_readings().
-
-### Dependencies
-
-This component requires:
-- Python 3.5 or later
-- haversine package (version 2.9.0)
-- viam-sdk
+The response format is identical to `GetReadings`.
 
 ### Error Handling
 
 The component will:
-- Return an empty object from get_readings() if both sensors are not configured
-- Return an empty object from get_readings() if any sensor reading has expired
-- Log a warning during startup if sensors are configured but not found
-- Log a warning if sensor readings have expired
-- Log info messages showing which type of sensor (Sensor or MovementSensor) was detected
-- Raise errors if:
-  - Sensor configuration is provided but missing required fields
-  - Invalid coordinates are provided to do_command()
-  - Sensor readings don't contain the expected data at the configured paths
-  - Invalid duration format is provided in expire field
-  - A component is neither Sensor nor MovementSensor
+- Return an empty object from `GetReadings` if both sensors are not configured
+- Return an empty object from `GetReadings` if either sensor reading has expired
+- Log a warning during startup if a sensor is configured but not found among the dependencies
+- Log a warning if a reading has expired or its timestamp cannot be read
+- Return an error if:
+  - A sensor cannot be read
+  - Sensor readings don't contain a value at the configured path, or that value is not a number
+  - `DoCommand` is missing `location_1` or `location_2`, or either is not a latitude/longitude object
+  - A coordinate is outside the range [-90, 90] latitude or [-180, 180] longitude
+  - The component has been closed, which happens when the machine reconfigures or shuts it down
 
+Configuration errors are reported at validation time: a configured sensor missing `name`, `latitude`, or `longitude`, or an `expire` value that isn't a valid duration.
+
+## Building
+
+The module is written in Go and builds to a single static binary.
+
+```bash
+make build      # host binary at bin/haversine
+make test       # run the unit tests
+make packages   # cross-compile a tarball per platform under bin/<goos>-<goarch>/
+make upload     # cross-compile, then print the viam module upload commands
+```
+
+Cloud builds run `make module.tar.gz`, which packages `bin/haversine` and `meta.json` at the root of the tarball. Windows builds are cross-compiled with a `.exe` suffix, and their `meta.json` entrypoint is rewritten to match.

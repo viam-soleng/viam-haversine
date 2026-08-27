@@ -9,17 +9,17 @@
       "api": "rdk:component:sensor",
       "model": "viam-soleng:haversine:haversine",
       "short_description": "Calculate the distance between two points on Earth using their latitude and longitude.",
-      "markdown_link": "README.md#model-mcvellahaversinehaversine"
+      "markdown_link": "README.md#model-viam-solenghaversinehaversine"
     }
   ],
   "applications": null,
   "markdown_link": "README.md",
-  "entrypoint": "./run.sh",
+  "entrypoint": "bin/haversine",
   "first_run": "",
   "build": {
-    "build": "./build.sh",
-    "setup": "./setup.sh",
-    "path": "dist/archive.tar.gz",
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
     "arch": [
       "linux/amd64",
       "linux/arm64",

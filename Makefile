@@ -13,7 +13,7 @@ ifeq ($(VIAM_TARGET_OS), windows)
 	MODULE_BINARY = bin/haversine.exe
 endif
 
-.PHONY: build lint update test module.tar.gz fix-meta-for-win packages module all setup clean upload
+.PHONY: build lint update test module.tar.gz packages module all setup clean upload
 
 build: $(MODULE_BINARY)
 
@@ -31,18 +31,18 @@ update:
 test:
 	go test ./...
 
-module.tar.gz: build
-	tar -czf module.tar.gz $(MODULE_BINARY) meta.json
-	-test -e .git/config && git checkout meta.json
-
-# On Windows cloud builds, rewrite the entrypoint to the .exe before packaging;
-# the trailing `git checkout meta.json` above restores the working copy afterward.
+# Packaging stages the tarball's meta.json under bin/pkg and never writes to the
+# working copy, so an uncommitted meta.json edit survives a build. On Windows
+# cloud builds the staged copy gets the .exe entrypoint; viam-server resolves the
+# entrypoint from the meta.json inside the tarball.
+module.tar.gz: build meta.json
+	@mkdir -p bin/pkg
 ifeq ($(VIAM_TARGET_OS), windows)
-module.tar.gz: fix-meta-for-win
+	jq '.entrypoint = "bin/haversine.exe"' meta.json > bin/pkg/meta.json
+else
+	cp meta.json bin/pkg/meta.json
 endif
-
-fix-meta-for-win:
-	jq '.entrypoint = "bin/haversine.exe"' meta.json > temp.json && mv temp.json meta.json
+	tar -czf module.tar.gz $(MODULE_BINARY) -C bin/pkg meta.json
 
 # `make packages` cross-compiles every architecture locally and produces
 # one tarball per arch at bin/<goos>-<goarch>/module.tar.gz, ready for `make upload`.

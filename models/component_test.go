@@ -51,6 +51,49 @@ func newTestComponent(t *testing.T, cfg *Config, deps resource.Dependencies) sen
 	return s
 }
 
+// TestReadingsDoesNotForwardExtra pins that the sources are read with no extra
+// of their own. viam-server's data manager passes {"fromDataManagement": true}
+// when it captures this component, and forwarding that would change the
+// behaviour of any source sensor that branches on it.
+func TestReadingsDoesNotForwardExtra(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]map[string]interface{}{}
+	record := func(name string, readings map[string]interface{}) *inject.Sensor {
+		s := inject.NewSensor(name)
+		s.ReadingsFunc = func(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen[name] = extra
+			return readings, nil
+		}
+		return s
+	}
+
+	deps := resource.Dependencies{
+		sensor.Named("a"): record("a", map[string]interface{}{"latitude": lyon.lat, "longitude": lyon.lng}),
+		sensor.Named("b"): record("b", map[string]interface{}{"latitude": paris.lat, "longitude": paris.lng}),
+	}
+	cfg := &Config{
+		Sensor1: &SensorConfig{Name: "a", Latitude: "latitude", Longitude: "longitude"},
+		Sensor2: &SensorConfig{Name: "b", Latitude: "latitude", Longitude: "longitude"},
+	}
+	s := newTestComponent(t, cfg, deps)
+
+	if _, err := s.Readings(t.Context(), map[string]interface{}{"fromDataManagement": true}); err != nil {
+		t.Fatalf("Readings returned error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, name := range []string{"a", "b"} {
+		if extra, ok := seen[name]; !ok {
+			t.Errorf("sensor %q was not read", name)
+		} else if len(extra) != 0 {
+			t.Errorf("sensor %q was read with extra = %v, want none forwarded", name, extra)
+		}
+	}
+}
+
 func TestReadingsAcrossSensorTypes(t *testing.T) {
 	deps := resource.Dependencies{
 		movementsensor.Named("gps1"): newTestMovementSensor("gps1", geo.NewPoint(lyon.lat, lyon.lng)),

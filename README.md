@@ -59,10 +59,10 @@ Each sensor configuration requires:
 - `longitude`: Dot-separated path to the longitude value in the sensor's readings
 
 Each sensor configuration optionally supports:
-- `updated`: Path to an ISO 8601 timestamp field (e.g., "2023-12-01T10:30:00Z")
+- `updated`: Path to an ISO 8601 timestamp field. Both the extended and basic forms are accepted, with the date and time separated by either `T` or a space, and an offset written as `Z`, `+00:00`, `+0000`, or `+00` — e.g. `2023-12-01T10:30:00Z`, `2023-12-01 10:30:00+00:00`, `20231201T103000Z`. A timestamp with no offset is read in the machine's local time zone.
 - `expire`: Duration string after which the reading is considered stale (e.g., "1d", "12h", "10m", "30s", "100ms")
 
-If both `updated` and `expire` are specified for a sensor, the reading is considered invalid and no distance is calculated when the timestamp is older than the expire duration.
+`updated` and `expire` must be configured together: staleness cannot be checked with only one of them, so configuring one alone is a validation error. When both are set, the reading is considered invalid and no distance is calculated once the timestamp is older than the expire duration.
 
 A path step indexes a map key, or reads a field off a structured reading. A movement sensor reports its position as a geo point, so `position.lat` and `position.lng` both work, as do the aliases `position.latitude` and `position.longitude`.
 
@@ -151,7 +151,7 @@ The component will:
   - A coordinate is outside the range [-90, 90] latitude or [-180, 180] longitude
   - The component has been closed, which happens when the machine reconfigures or shuts it down
 
-Configuration errors are reported at validation time: a configured sensor missing `name`, `latitude`, or `longitude`, or an `expire` value that isn't a valid duration.
+Configuration errors are reported at validation time: a configured sensor missing `name`, `latitude`, or `longitude`, an `updated` or `expire` set without the other, or an `expire` value that isn't a valid duration.
 
 ## Building
 

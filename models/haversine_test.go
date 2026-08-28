@@ -123,6 +123,16 @@ func TestToTime(t *testing.T) {
 		"2023-12-01T10:30:00Z",
 		"2023-12-01T10:30:00+00:00",
 		"2023-12-01T10:30:00.000Z",
+		// Spellings Python's fromisoformat accepts. The space separator is
+		// what str(datetime.now(timezone.utc)) produces, so a Python source
+		// sensor emits it by default.
+		"2023-12-01 10:30:00+00:00",
+		"2023-12-01 10:30:00.000000+00:00",
+		"2023-12-01T10:30:00+0000",
+		"2023-12-01T10:30:00-00",
+		"20231201T103000Z",
+		"20231201T103000+0000",
+		"2023-12-01T10:30Z",
 	} {
 		got, err := toTime(input)
 		if err != nil {
@@ -133,8 +143,20 @@ func TestToTime(t *testing.T) {
 		}
 	}
 
-	if _, err := toTime("not a timestamp"); err == nil {
-		t.Error("toTime on garbage succeeded, want an error")
+	// A zoneless timestamp is read in the local zone, so the same wall clock
+	// time is a different instant depending on where the machine runs.
+	local, err := toTime("2023-12-01 10:30:00")
+	if err != nil {
+		t.Fatalf("toTime on a zoneless timestamp returned error: %v", err)
+	}
+	if !local.Equal(time.Date(2023, 12, 1, 10, 30, 0, 0, time.Local)) {
+		t.Errorf("toTime on a zoneless timestamp = %v, want it read in the local zone", local)
+	}
+
+	for _, input := range []string{"not a timestamp", "", "2023-13-45T99:99:99Z"} {
+		if _, err := toTime(input); err == nil {
+			t.Errorf("toTime(%q) succeeded, want an error", input)
+		}
 	}
 }
 
@@ -145,19 +167,32 @@ func TestReadingValid(t *testing.T) {
 
 	src := &source{updatedPath: []string{"updated"}, expire: 30 * time.Minute}
 
-	if !s.readingValid(map[string]interface{}{"updated": recent}, src) {
-		t.Error("a reading one minute old was reported as expired")
+	if valid, err := s.readingValid(map[string]interface{}{"updated": recent}, src); err != nil || !valid {
+		t.Errorf("a reading one minute old was rejected: valid=%v err=%v", valid, err)
 	}
-	if s.readingValid(map[string]interface{}{"updated": stale}, src) {
-		t.Error("a reading two hours old was reported as valid")
+	if valid, err := s.readingValid(map[string]interface{}{"updated": stale}, src); err != nil || valid {
+		t.Errorf("a reading two hours old was reported as valid: valid=%v err=%v", valid, err)
 	}
-	if s.readingValid(map[string]interface{}{}, src) {
-		t.Error("a reading missing its timestamp was reported as valid")
+
+	// A timestamp that cannot be read at all is reported separately from an
+	// expired one: the caller says so rather than blaming the reading's age.
+	for _, readings := range []map[string]interface{}{
+		{},
+		{"updated": "not a timestamp"},
+		{"updated": []string{"wrong type"}},
+	} {
+		valid, err := s.readingValid(readings, src)
+		if err == nil {
+			t.Errorf("readingValid(%v) returned no error, want an unreadable timestamp reported", readings)
+		}
+		if valid {
+			t.Errorf("readingValid(%v) = true, want false", readings)
+		}
 	}
 
 	// Without both an updated path and an expire duration, age is not checked.
-	if !s.readingValid(map[string]interface{}{"updated": stale}, &source{}) {
-		t.Error("an unconfigured expiry rejected a stale reading")
+	if valid, err := s.readingValid(map[string]interface{}{"updated": stale}, &source{}); err != nil || !valid {
+		t.Errorf("an unconfigured expiry rejected a stale reading: valid=%v err=%v", valid, err)
 	}
 }
 
@@ -211,11 +246,63 @@ func TestValidate(t *testing.T) {
 		{Sensor1: &SensorConfig{Latitude: "a", Longitude: "b"}},
 		{Sensor1: &SensorConfig{Name: "gps1", Longitude: "b"}},
 		{Sensor2: &SensorConfig{Name: "gps1", Latitude: "a"}},
-		{Sensor1: complete, Sensor2: &SensorConfig{Name: "p", Latitude: "a", Longitude: "b", Expire: "1w"}},
+		{Sensor1: complete, Sensor2: &SensorConfig{Name: "p", Latitude: "a", Longitude: "b", Updated: "t", Expire: "1w"}},
+		// Half a staleness config never checks the age, so it is rejected
+		// rather than silently reporting stale coordinates as fresh.
+		{Sensor1: &SensorConfig{Name: "gps1", Latitude: "a", Longitude: "b", Expire: "10m"}},
+		{Sensor1: &SensorConfig{Name: "gps1", Latitude: "a", Longitude: "b", Updated: "t"}},
 	} {
 		if _, _, err := cfg.Validate(""); err == nil {
 			t.Errorf("Validate(%v) succeeded, want an error", cfg)
 		}
+	}
+}
+
+func TestCoordinateRejectsNonFiniteValues(t *testing.T) {
+	// A movement sensor with no position fix reports NaN for both fields. Every
+	// comparison against NaN is false, so a plain range check lets it through
+	// and the reported distances all become NaN.
+	for _, c := range []coordinate{
+		{lat: math.NaN(), lng: math.NaN()},
+		{lat: math.NaN(), lng: 4.8422},
+		{lat: 45.7597, lng: math.NaN()},
+		{lat: math.Inf(1), lng: 4.8422},
+		{lat: 45.7597, lng: math.Inf(-1)},
+	} {
+		if err := c.validate(); err == nil {
+			t.Errorf("coordinate{%v, %v}.validate() succeeded, want an error", c.lat, c.lng)
+		}
+	}
+}
+
+// embedded reproduces the shape that makes reflect.Value.FieldByNameFunc panic:
+// the named field is promoted through an embedded pointer that is nil.
+type embeddedPosition struct {
+	Latitude float64
+}
+
+type promotedReading struct {
+	*embeddedPosition
+	Name string
+}
+
+func TestFieldValueOnNilEmbeddedPointer(t *testing.T) {
+	reading := promotedReading{Name: "gps1"}
+
+	// The panic this guards against would take the module process down rather
+	// than report an unusable path.
+	if _, err := fieldValue(reading, "latitude"); err == nil {
+		t.Error("fieldValue through a nil embedded pointer succeeded, want an error")
+	}
+
+	// A field promoted through a populated embedded pointer still resolves.
+	reading.embeddedPosition = &embeddedPosition{Latitude: 45.7597}
+	got, err := fieldValue(reading, "latitude")
+	if err != nil {
+		t.Fatalf("fieldValue on a promoted field returned error: %v", err)
+	}
+	if got != 45.7597 {
+		t.Errorf("fieldValue on a promoted field = %v, want 45.7597", got)
 	}
 }
 

@@ -80,6 +80,11 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		if s.conf.Name == "" || s.conf.Latitude == "" || s.conf.Longitude == "" {
 			return nil, nil, fmt.Errorf("%s if configured must have name, latitude, and longitude fields", s.field)
 		}
+		// Staleness needs both halves: with only one of them readingValid never checks the age,
+		// so a half-configured expiry would silently report indefinitely stale coordinates as fresh.
+		if (s.conf.Updated == "") != (s.conf.Expire == "") {
+			return nil, nil, fmt.Errorf("%s: updated and expire must be configured together", s.field)
+		}
 		if s.conf.Expire != "" {
 			if _, err := parseDuration(s.conf.Expire); err != nil {
 				return nil, nil, fmt.Errorf("%s: %w", s.field, err)
@@ -249,11 +254,12 @@ func (s *haversineSensor) Readings(ctx context.Context, extra map[string]interfa
 		return map[string]interface{}{}, nil
 	}
 
-	readings1, err := source1.reader.Readings(ctx, extra)
+	// Don't return extra of the sources
+	readings1, err := source1.reader.Readings(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error reading sensor_1 '%s': %w", source1.name, err)
 	}
-	readings2, err := source2.reader.Readings(ctx, extra)
+	readings2, err := source2.reader.Readings(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error reading sensor_2 '%s': %w", source2.name, err)
 	}
@@ -261,11 +267,21 @@ func (s *haversineSensor) Readings(ctx context.Context, extra map[string]interfa
 	s.logger.Debugf("Sensor 1 readings: %v", readings1)
 	s.logger.Debugf("Sensor 2 readings: %v", readings2)
 
-	if !s.readingValid(readings1, source1) {
+	valid1, err := s.readingValid(readings1, source1)
+	if err != nil {
+		s.logger.Warnf("Could not read the sensor_1 '%s' timestamp: %v", source1.name, err)
+		return map[string]interface{}{}, nil
+	}
+	if !valid1 {
 		s.logger.Warn("Sensor 1 reading has expired")
 		return map[string]interface{}{}, nil
 	}
-	if !s.readingValid(readings2, source2) {
+	valid2, err := s.readingValid(readings2, source2)
+	if err != nil {
+		s.logger.Warnf("Could not read the sensor_2 '%s' timestamp: %v", source2.name, err)
+		return map[string]interface{}{}, nil
+	}
+	if !valid2 {
 		s.logger.Warn("Sensor 2 reading has expired")
 		return map[string]interface{}{}, nil
 	}
@@ -327,6 +343,13 @@ type coordinate struct {
 }
 
 func (c coordinate) validate() error {
+	// Movement sensors report NaN for both fields when they have no position
+	// fix. Every comparison against NaN is false, so without this check the
+	// range guards below pass it through and every distance reported becomes
+	// NaN rather than the component reporting no reading.
+	if math.IsNaN(c.lat) || math.IsNaN(c.lng) || math.IsInf(c.lat, 0) || math.IsInf(c.lng, 0) {
+		return fmt.Errorf("coordinate (%v, %v) is not a finite location", c.lat, c.lng)
+	}
 	if c.lat < -90 || c.lat > 90 {
 		return fmt.Errorf("latitude %v is out of range [-90, 90]", c.lat)
 	}
@@ -381,25 +404,25 @@ func (src *source) point(readings map[string]interface{}) (coordinate, error) {
 }
 
 // readingValid reports whether a reading is recent enough. A source without
-// both an updated path and an expire duration is always valid. A timestamp that
-// cannot be read is treated as expired.
-func (s *haversineSensor) readingValid(readings map[string]interface{}, src *source) bool {
+// both an updated path and an expire duration is always valid. A non-nil error
+// means the timestamp could not be read at all, which is a misconfigured path
+// or an unexpected format rather than a stale reading, and the caller reports
+// it as such: the two are worth telling apart when debugging a silent sensor.
+func (s *haversineSensor) readingValid(readings map[string]interface{}, src *source) (bool, error) {
 	if src.updatedPath == nil || src.expire == 0 {
-		return true
+		return true, nil
 	}
 
 	raw, err := valueAtPath(readings, src.updatedPath)
 	if err != nil {
-		s.logger.Warnf("Error checking reading validity: %v", err)
-		return false
+		return false, err
 	}
 	updated, err := toTime(raw)
 	if err != nil {
-		s.logger.Warnf("Error checking reading validity: %v", err)
-		return false
+		return false, err
 	}
 
-	return time.Since(updated) <= src.expire
+	return time.Since(updated) <= src.expire, nil
 }
 
 func calculateDistances(point1, point2 coordinate) map[string]interface{} {
@@ -542,13 +565,26 @@ func fieldValue(current interface{}, key string) (interface{}, error) {
 		}
 		return entry.Interface(), nil
 	case reflect.Struct:
-		field := value.FieldByNameFunc(func(name string) bool {
+		match, ok := value.Type().FieldByNameFunc(func(name string) bool {
 			return strings.EqualFold(name, key)
 		})
-		if field.IsValid() && field.CanInterface() {
-			return field.Interface(), nil
+		if !ok {
+			return nil, fmt.Errorf("field %q not found on %T", key, current)
 		}
-		return nil, fmt.Errorf("field %q not found on %T", key, current)
+		field := value
+		for _, index := range match.Index {
+			for field.Kind() == reflect.Pointer {
+				if field.IsNil() {
+					return nil, fmt.Errorf("cannot access %q, an embedded value on %T is nil", key, current)
+				}
+				field = field.Elem()
+			}
+			field = field.Field(index)
+		}
+		if !field.CanInterface() {
+			return nil, fmt.Errorf("field %q on %T is not exported", key, current)
+		}
+		return field.Interface(), nil
 	default:
 	}
 
@@ -582,20 +618,55 @@ func toFloat(value interface{}) (float64, error) {
 	}
 }
 
-// timeLayouts covers the ISO 8601 timestamps sensors report. The zoneless
-// layouts are parsed in the local zone, matching how the reading's age is
-// measured against the local clock.
+// timeLayouts covers the ISO 8601 timestamps sensors report, in both the
+// extended (2024-05-01T12:00:00) and basic (20240501T120000) forms.
+// normalizeTimestamp reduces the remaining spellings Python's fromisoformat
+// accepts to these. The zoneless layouts are parsed in the local zone,
+// matching how the reading's age is measured against the local clock.
 var timeLayouts = []struct {
 	layout string
 	local  bool
 }{
 	{time.RFC3339Nano, false},
 	{time.RFC3339, false},
+	{"2006-01-02T15:04Z07:00", false},
 	{"2006-01-02T15:04:05.999999999", true},
 	{"2006-01-02T15:04:05", true},
-	{"2006-01-02 15:04:05.999999999", true},
-	{"2006-01-02 15:04:05", true},
+	{"2006-01-02T15:04", true},
+	{"20060102T150405.999999999Z07:00", false},
+	{"20060102T150405Z07:00", false},
+	{"20060102T1504Z07:00", false},
+	{"20060102T150405.999999999", true},
+	{"20060102T150405", true},
+	{"20060102T1504", true},
 	{"2006-01-02", true},
+	{"20060102", true},
+}
+
+var (
+	// isoSeparator matches the space Python's fromisoformat allows in place of
+	// the T between the date and the time. str(datetime.now(timezone.utc))
+	// produces it, so sensors ported from Python emit it routinely.
+	isoSeparator = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}|\d{8}) `)
+
+	// isoOffsetHHMM and isoOffsetHH match a trailing UTC offset written
+	// without a colon (+0000) or as hours alone (+00). fromisoformat reads
+	// both; Go's layouts only read the +00:00 form.
+	isoOffsetHHMM = regexp.MustCompile(`([Tt ][\d:.]+[+-]\d{2})(\d{2})$`)
+	isoOffsetHH   = regexp.MustCompile(`([Tt ][\d:.]+[+-]\d{2})$`)
+)
+
+// normalizeTimestamp rewrites the ISO 8601 spellings that Go's layouts do not
+// accept into ones they do. It leaves anything it does not recognise alone,
+// so an unparseable timestamp still fails in toTime rather than here.
+func normalizeTimestamp(text string) string {
+	switch {
+	case isoOffsetHHMM.MatchString(text):
+		text = isoOffsetHHMM.ReplaceAllString(text, "$1:$2")
+	case isoOffsetHH.MatchString(text):
+		text += ":00"
+	}
+	return isoSeparator.ReplaceAllString(text, "${1}T")
 }
 
 func toTime(value interface{}) (time.Time, error) {
@@ -604,7 +675,7 @@ func toTime(value interface{}) (time.Time, error) {
 		return typed, nil
 	case string:
 		// Python's fromisoformat accepts a trailing Z only as an offset.
-		text := strings.TrimSpace(typed)
+		text := normalizeTimestamp(strings.TrimSpace(typed))
 		for _, candidate := range timeLayouts {
 			if candidate.local {
 				if parsed, err := time.ParseInLocation(candidate.layout, text, time.Local); err == nil {
@@ -616,7 +687,7 @@ func toTime(value interface{}) (time.Time, error) {
 				return parsed, nil
 			}
 		}
-		return time.Time{}, fmt.Errorf("could not parse timestamp %q", text)
+		return time.Time{}, fmt.Errorf("could not parse timestamp %q", typed)
 	default:
 		return time.Time{}, fmt.Errorf("unsupported timestamp type %T", value)
 	}
